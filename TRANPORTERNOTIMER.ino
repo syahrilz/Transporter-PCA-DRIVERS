@@ -6,12 +6,13 @@
 #include "var.h"
 
 //PIN MOTOR motor
-#define M5A 18
-#define M5B 19
+#define M5A 32
+#define M5B 33
+
 #define M1A 27
 #define M1B 13
-#define M2A 33
-#define M2B 32
+#define M2A 19
+#define M2B 18
 #define M3A 4
 #define M3B 17
 #define M4A 25
@@ -34,6 +35,30 @@
 #define ADDR_POSITION_BUTTONS_MODE3 366  // ✅ UBAH:   Mode 3: 3 button (3x1 bytes = 3 bytes)
 #define ADDR_POSITION_BUTTONS_MODE4 369  // ✅ UBAH:  Mode 4: 3 button (3x1 bytes = 3 bytes)
 #define ADDR_POSITION_BUTTONS_MODE5 372  // ✅ TAMBAH: Mode 5: 3 button (3x1 bytes = 3 bytes)
+
+// ============ THROTTLE SYSTEM VARIABLES ============
+// EEPROM addresses untuk throttle settings
+#define ADDR_THROTTLE_ENABLED 375    // 1 byte - throttle on/off
+#define ADDR_THROTTLE_PWM_STEP 376   // 4 bytes - int
+#define ADDR_THROTTLE_INTERVAL 380   // 4 bytes - int (microseconds)
+#define ADDR_THROTTLE_THRESHOLD 384  // 4 bytes - int
+
+// Throttle parameters
+bool throttleEnabled = false;           // Throttle aktif/nonaktif
+int throttlePwmStep = 50;               // PWM increment per tick
+int throttleIntervalUs = 20000;         // Timer interval (20ms)
+int throttleActivationThreshold = 100;  // Throttle aktif jika PWM > threshold
+
+// Hardware timer untuk throttle
+hw_timer_t *throttleTimer = NULL;
+volatile SemaphoreHandle_t throttleTimerSemaphore;
+
+// Throttle state variables - PWM based
+volatile int currentPwmMotor[4] = { 0, 0, 0, 0 };  // Current PWM motor 1-4
+volatile int targetPwmMotor[4] = { 0, 0, 0, 0 };   // Target PWM dari kinematik
+
+// Menu throttle variables
+int throttleMenuSelected = 0;  // 0=PWM Step, 1=Interval, 2=Threshold, 3=Enable/Disable
 
 // ✅ UBAH:  Position control arrays untuk 5 mode
 long positionTargets[5][3] = { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 } };     // [mode][target]
@@ -93,7 +118,7 @@ hw_timer_t *timer = NULL;
 volatile SemaphoreHandle_t timerSemaphore;
 // portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 
-int limitTimeOut = 10;
+int limitTimeOut = 100;
 int countTimeOutOled = 0;
 int oledTimeOut = false;
 
@@ -122,7 +147,8 @@ enum OledMode {
   OLED_MENU_SETTING_SERVO,
   OLED_MENU_SETTING_LAMBDA_LENGTHALPHA,
   OLED_MENU_BUTTON_MAPPING,
-  OLED_MENU_POSITION_CONTROL  // Menu position control
+  OLED_MENU_POSITION_CONTROL,  // Menu position control
+  OLED_MENU_THROTTLE_SETTING
 };
 
 // ✅ UBAH: Position menu states untuk navigasi yang lebih mudah
@@ -206,19 +232,29 @@ void ARDUINO_ISR_ATTR encoder_ISR() {
 }
 
 void ARDUINO_ISR_ATTR onTimer() {
-  // Increment the counter and set the time of ISR
   portENTER_CRITICAL_ISR(&timerMux);
 
-  if (oledMode == OLED_INFO) {
-    countTimeOutOled++;
-    if (countTimeOutOled == limitTimeOut) {
+  if (oledMode == OLED_INFO && countTimeOutOled < limitTimeOut) {
+    if (++countTimeOutOled == limitTimeOut) {
       oledTimeOut = true;
     }
   }
+
   portEXIT_CRITICAL_ISR(&timerMux);
-  // Give a semaphore that we can check in the loop
   xSemaphoreGiveFromISR(timerSemaphore, NULL);
-  // It is safe to use digitalRead/Write here if you want to toggle an output
+}
+
+// ============ THROTTLE TIMER ISR ============
+void ARDUINO_ISR_ATTR onThrottleTimer() {
+  xSemaphoreGiveFromISR(throttleTimerSemaphore, NULL);
+}
+
+void setupThrottleTimer() {
+  throttleTimerSemaphore = xSemaphoreCreateBinary();
+  throttleTimer = timerBegin(1000000);  // 1MHz
+  timerAttachInterrupt(throttleTimer, &onThrottleTimer);
+  timerAlarm(throttleTimer, throttleIntervalUs, true, 0);
+  Serial.println("Throttle Timer initialized");
 }
 
 
@@ -1056,6 +1092,8 @@ void processGamepad() {
   } else {
     stopMotor();
   }
+
+  // Serial.printf("ly:%d lx:%d rx:%d\n",ly,lx,rx);
 }
 
 void kinematik(int x, int y, int th) {
@@ -1070,7 +1108,19 @@ void kinematik(int x, int y, int th) {
   m4 = constrain(m4, -1023, 1023);
 
   int pwm[4] = { m1, m2, m3, m4 };
-  setPwm(pwm);
+  // ✅ UBAH:  Gunakan throttle jika enabled
+  if (throttleEnabled) {
+    // Set sebagai target PWM untuk throttle system
+    portENTER_CRITICAL(&timerMux);
+    targetPwmMotor[0] = m1;
+    targetPwmMotor[1] = m2;
+    targetPwmMotor[2] = m3;
+    targetPwmMotor[3] = m4;
+    portEXIT_CRITICAL(&timerMux);
+  } else {
+    // Langsung apply tanpa throttle
+    setPwm(pwm);
+  }
 }
 
 // ============ DRAW FUNCTIONS ============
@@ -1079,7 +1129,7 @@ void drawInfo() {
   // countTimeOutOled=0;
   if (oledTimeOut) {
     display.oled_command(SH110X_DISPLAYOFF);
-  }else {
+  } else {
     display.oled_command(SH110X_DISPLAYON);
   }
   display.clearDisplay();
@@ -1198,6 +1248,72 @@ void updateDisplayRealTime() {
 
 //   display.display();
 // }
+
+void drawThrottleSettingMenu() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+
+  display.setCursor(17, 0);
+  display.println("THROTTLE SETTING");
+  display.drawLine(0, 10, 127, 10, 1);
+
+  // PWM Step
+  if (throttleMenuSelected == 0) {
+    display.fillRect(5, 16, 118, 10, WHITE);
+    display.setTextColor(BLACK, WHITE);
+  } else {
+    display.setTextColor(WHITE);
+  }
+  display.setCursor(7, 17);
+  display.print("PWM Step:");
+  display.setCursor(75, 17);
+  display.print(throttlePwmStep);
+  display.setTextColor(WHITE);
+
+  // Interval (ms)
+  if (throttleMenuSelected == 1) {
+    display.fillRect(5, 28, 118, 10, WHITE);
+    display.setTextColor(BLACK, WHITE);
+  } else {
+    display.setTextColor(WHITE);
+  }
+  display.setCursor(7, 29);
+  display.print("Interval:");
+  display.setCursor(75, 29);
+  display.print(throttleIntervalUs / 1000);
+  display.print(" ms");
+  display.setTextColor(WHITE);
+
+  // Threshold
+  if (throttleMenuSelected == 2) {
+    display.fillRect(5, 40, 118, 10, WHITE);
+    display.setTextColor(BLACK, WHITE);
+  } else {
+    display.setTextColor(WHITE);
+  }
+  display.setCursor(7, 41);
+  display.print("Threshold:");
+  display.setCursor(75, 41);
+  display.print(throttleActivationThreshold);
+  display.setTextColor(WHITE);
+
+  // Enable/Disable
+  if (throttleMenuSelected == 3) {
+    display.fillRect(5, 52, 118, 10, WHITE);
+    display.setTextColor(BLACK, WHITE);
+  } else {
+    display.setTextColor(WHITE);
+  }
+  display.setCursor(7, 53);
+  display.print("Throttle:");
+  display.setCursor(75, 53);
+  display.print(throttleEnabled ? "ON" : "OFF");
+  display.setTextColor(WHITE);
+
+  display.display();
+}
+
 void drawSettingServoMenu() {
   display.clearDisplay();
   display.setTextSize(1);
@@ -1429,6 +1545,168 @@ void drawButtonMappingMenu() {
   }
 
   display.display();
+}
+
+void handleThrottleSettingMenuNavigation() {
+  static unsigned long lastInput = 0;
+  static unsigned long lastRepeat = 0;
+  unsigned long now = millis();
+
+  bool upPressed = Ps3.data.button.up && !lastUp;
+  bool downPressed = Ps3.data.button.down && !lastDown;
+  bool leftPressed = Ps3.data.button.left && !lastLeft;
+  bool rightPressed = Ps3.data.button.right && !lastRight;
+  bool crossPressed = Ps3.data.button.cross && !lastCross;
+  bool circlePressed = Ps3.data.button.circle && !lastCircle;
+
+  lastUp = Ps3.data.button.up;
+  lastDown = Ps3.data.button.down;
+  lastLeft = Ps3.data.button.left;
+  lastRight = Ps3.data.button.right;
+  lastCross = Ps3.data.button.cross;
+  lastCircle = Ps3.data.button.circle;
+
+  // Navigasi UP/DOWN
+  if (upPressed && (now - lastInput >= BUTTON_DEBOUNCE)) {
+    throttleMenuSelected = (throttleMenuSelected - 1 + 4) % 4;
+    Serial.printf("▲ Selected: %d\n", throttleMenuSelected);
+    drawThrottleSettingMenu();
+    lastInput = now;
+    return;
+  }
+
+  if (downPressed && (now - lastInput >= BUTTON_DEBOUNCE)) {
+    throttleMenuSelected = (throttleMenuSelected + 1) % 4;
+    Serial.printf("▼ Selected: %d\n", throttleMenuSelected);
+    drawThrottleSettingMenu();
+    lastInput = now;
+    return;
+  }
+
+  // Save dengan CROSS
+  // Save dengan CROSS
+  if (crossPressed && (now - lastInput >= BUTTON_DEBOUNCE)) {
+    Serial.println("💾 Saving throttle settings...");
+
+    // ✅ UBAH:  Save sebagai uint8_t untuk konsistensi
+    uint8_t enabledByte = throttleEnabled ? 1 : 0;
+    EEPROM.put(ADDR_THROTTLE_ENABLED, enabledByte);
+
+    EEPROM.put(ADDR_THROTTLE_PWM_STEP, throttlePwmStep);
+    EEPROM.put(ADDR_THROTTLE_INTERVAL, throttleIntervalUs);
+    EEPROM.put(ADDR_THROTTLE_THRESHOLD, throttleActivationThreshold);
+    EEPROM.commit();
+
+    Serial.printf("✅ Saved:   Enabled=%d, Step=%d, Interval=%d, Threshold=%d\n",
+                  enabledByte, throttlePwmStep, throttleIntervalUs, throttleActivationThreshold);
+
+    if (throttleTimer) {
+      timerAlarm(throttleTimer, throttleIntervalUs, true, 0);
+    }
+
+    display.clearDisplay();
+    display.drawBitmap(48, 8, _saved, 32, 49, 1);
+    display.display();
+    delay(500);
+
+    oledMode = OLED_INFO;
+    drawInfo();
+    lastInput = now;
+    return;
+  }
+
+  // Exit dengan CIRCLE
+  if (circlePressed && (now - lastInput >= BUTTON_DEBOUNCE)) {
+    Serial.println("❌ Cancel throttle settings");
+    oledMode = OLED_INFO;
+    drawInfo();
+    lastInput = now;
+    return;
+  }
+
+  // ✅ THROTTLE ON/OFF TOGGLE - DENGAN DEBUG LENGKAP
+  if (throttleMenuSelected == 3) {
+    if (leftPressed && (now - lastInput >= BUTTON_DEBOUNCE)) {
+      // ✅ TAMBAH:  Print state SEBELUM toggle
+      Serial.printf("🔵 BEFORE toggle: throttleEnabled = %d (address: 0x%p)\n",
+                    throttleEnabled, &throttleEnabled);
+
+      // Toggle dengan explicit assignment
+      if (throttleEnabled == true) {
+        throttleEnabled = false;
+      } else {
+        throttleEnabled = true;
+      }
+
+      // ✅ TAMBAH:  Print state SETELAH toggle
+      Serial.printf("🟢 AFTER toggle: throttleEnabled = %d\n", throttleEnabled);
+      Serial.printf("◄ Toggle Result: %s\n", throttleEnabled ? "ON" : "OFF");
+
+      drawThrottleSettingMenu();
+      lastInput = now;
+      return;
+    }
+
+    if (rightPressed && (now - lastInput >= BUTTON_DEBOUNCE)) {
+      Serial.printf("🔵 BEFORE toggle: throttleEnabled = %d (address: 0x%p)\n",
+                    throttleEnabled, &throttleEnabled);
+
+      if (throttleEnabled == true) {
+        throttleEnabled = false;
+      } else {
+        throttleEnabled = true;
+      }
+
+      Serial.printf("🟢 AFTER toggle: throttleEnabled = %d\n", throttleEnabled);
+      Serial.printf("► Toggle Result: %s\n", throttleEnabled ? "ON" : "OFF");
+
+      drawThrottleSettingMenu();
+      lastInput = now;
+      return;
+    }
+  } else {
+    // NUMERIC PARAMETERS
+    if (now - lastRepeat >= AUTO_REPEAT_DELAY) {
+      bool changed = false;
+
+      if (Ps3.data.button.left) {
+        if (throttleMenuSelected == 0) {
+          throttlePwmStep -= 5;
+          if (throttlePwmStep < 1) throttlePwmStep = 1;
+          Serial.printf("◄ PWM Step:  %d\n", throttlePwmStep);
+        } else if (throttleMenuSelected == 1) {
+          throttleIntervalUs -= 5000;
+          if (throttleIntervalUs < 5000) throttleIntervalUs = 5000;
+          Serial.printf("◄ Interval: %dms\n", throttleIntervalUs / 1000);
+        } else if (throttleMenuSelected == 2) {
+          throttleActivationThreshold -= 10;
+          if (throttleActivationThreshold < 0) throttleActivationThreshold = 0;
+          Serial.printf("◄ Threshold: %d\n", throttleActivationThreshold);
+        }
+        changed = true;
+      } else if (Ps3.data.button.right) {
+        if (throttleMenuSelected == 0) {
+          throttlePwmStep += 5;
+          if (throttlePwmStep > 500) throttlePwmStep = 500;
+          Serial.printf("► PWM Step: %d\n", throttlePwmStep);
+        } else if (throttleMenuSelected == 1) {
+          throttleIntervalUs += 5000;
+          if (throttleIntervalUs > 1000000) throttleIntervalUs = 1000000;
+          Serial.printf("► Interval: %dms\n", throttleIntervalUs / 1000);
+        } else if (throttleMenuSelected == 2) {
+          throttleActivationThreshold += 10;
+          if (throttleActivationThreshold > 500) throttleActivationThreshold = 500;
+          Serial.printf("► Threshold: %d\n", throttleActivationThreshold);
+        }
+        changed = true;
+      }
+
+      if (changed) {
+        drawThrottleSettingMenu();
+        lastRepeat = now;
+      }
+    }
+  }
 }
 
 void handleSettingServoMenuNavigation() {
@@ -1819,9 +2097,9 @@ void showModeNotification(int mode) {
   Serial.printf("🔄 Switched to Position Mode %d\n", mode);
 
   display.oled_command(SH110X_DISPLAYON);
-  oledTimeOut=false;
-  limitTimeOut=3;
-  countTimeOutOled=0;
+  oledTimeOut = false;
+  limitTimeOut = 50;
+  countTimeOutOled = 0;
   display.clearDisplay();
   display.setTextSize(2);
   display.setTextColor(WHITE);
@@ -1856,11 +2134,7 @@ void setup() {
   }
 
   display.clearDisplay();
-  display.drawBitmap(46, 4, _eepros, 36, 42, 1);
-  display.setTextSize(1);
-  display.setTextColor(WHITE);
-  display.setCursor(47, 52);
-  display.print("EEPROS");
+  display.drawBitmap(12, 3, _AVATAR, 89, 59, 1);
   display.display();
 
   setupEncoder();
@@ -1877,7 +2151,7 @@ void setup() {
 
   // Set alarm to call onTimer function every second (value in microseconds).
   // Repeat the alarm (third parameter) with unlimited count = 0 (fourth parameter).
-  timerAlarm(timer, 1000000, true, 0);
+  timerAlarm(timer, 100000, true, 0);
 
   servoTimer = timerBegin(1000000);
   timerAttachInterrupt(servoTimer, &onServoTimer);
@@ -1955,6 +2229,41 @@ void setup() {
 
   Serial.println("======================\n");
 
+  // ============ LOAD THROTTLE SETTINGS ============
+  Serial.println("\n=== Loading Throttle Settings ===");
+
+  // ✅ UBAH:   Load sebagai uint8_t dulu untuk cek nilai
+  uint8_t throttleEnabledByte;
+  EEPROM.get(ADDR_THROTTLE_ENABLED, throttleEnabledByte);
+  EEPROM.get(ADDR_THROTTLE_PWM_STEP, throttlePwmStep);
+  EEPROM.get(ADDR_THROTTLE_INTERVAL, throttleIntervalUs);
+  EEPROM.get(ADDR_THROTTLE_THRESHOLD, throttleActivationThreshold);
+
+  // ✅ VALIDASI:  Jika bukan 0 atau 1, set default
+  if (throttleEnabledByte != 0 && throttleEnabledByte != 1) {
+    Serial.printf("⚠️ Invalid throttle enabled value: %d (resetting to default)\n", throttleEnabledByte);
+    throttleEnabled = false;  // Default OFF
+
+    // Save default value ke EEPROM
+    uint8_t defaultEnabled = 0;
+    EEPROM.put(ADDR_THROTTLE_ENABLED, defaultEnabled);
+    EEPROM.commit();
+  } else {
+    throttleEnabled = (throttleEnabledByte == 1);
+  }
+
+  // Validasi parameter lainnya
+  if (throttlePwmStep < 1 || throttlePwmStep > 500) throttlePwmStep = 50;
+  if (throttleIntervalUs < 5000 || throttleIntervalUs > 1000000) throttleIntervalUs = 20000;
+  if (throttleActivationThreshold < 0 || throttleActivationThreshold > 500) throttleActivationThreshold = 100;
+
+  Serial.printf("Throttle:  %s (raw byte: %d)\n", throttleEnabled ? "ENABLED" : "DISABLED", throttleEnabledByte);
+  Serial.printf("PWM Step: %d\n", throttlePwmStep);
+  Serial.printf("Interval: %d us (%d ms)\n", throttleIntervalUs, throttleIntervalUs / 1000);
+  Serial.printf("Threshold: %d\n", throttleActivationThreshold);
+
+  // Initialize throttle timer
+  setupThrottleTimer();
   for (int i = 0; i < 4; i++) {
     setServoAngleStrong(i, servoClose[i]);
     servoButtonMap[i].state1 = false;
@@ -1985,6 +2294,9 @@ void loop() {
   }
 
   updatePositionControl();
+  if (throttleEnabled && xSemaphoreTake(throttleTimerSemaphore, 0) == pdTRUE) {
+    updatePwmThrottle();
+  }
   updateDisplayRealTime();
 
   handlePositionControlTriggers();
@@ -2033,7 +2345,14 @@ void loop() {
         drawPositionTargetMenu();
         Serial.println("Enter POSITION CONTROL - 5-Mode Selection");
       } else if (oledMode == OLED_MENU_POSITION_CONTROL) {
+        oledMode = OLED_MENU_THROTTLE_SETTING;  // ✅ Arahkan ke throttle menu
+        throttleMenuSelected = 0;
+        drawThrottleSettingMenu();
+        Serial.println("Enter THROTTLE SETTING menu");
+      } else if (oledMode == OLED_MENU_THROTTLE_SETTING) {
         oledMode = OLED_INFO;
+        oledTimeOut = false;
+        countTimeOutOled = 0;
         drawInfo();
         Serial.println("Back to INFO");
       }
@@ -2041,7 +2360,7 @@ void loop() {
     }
     lastSelectForMenu = selectPressed;
 
-    // Handle menu navigation
+    // ✅ Handle menu navigation
     if (oledMode == OLED_MENU_SETTING_SERVO) {
       handleSettingServoMenuNavigation();
     } else if (oledMode == OLED_MENU_SETTING_LAMBDA_LENGTHALPHA) {
@@ -2050,6 +2369,8 @@ void loop() {
       handleButtonMappingMenuNavigation();
     } else if (oledMode == OLED_MENU_POSITION_CONTROL) {
       handlePositionTargetMenuNavigation();
+    } else if (oledMode == OLED_MENU_THROTTLE_SETTING) {
+      handleThrottleSettingMenuNavigation();
     }
   }
 }
@@ -2065,11 +2386,93 @@ void setupMotor() {
 }
 
 void stopMotor() {
+  // Reset throttle state
+  portENTER_CRITICAL(&timerMux);
+  for (int i = 0; i < 4; i++) {
+    currentPwmMotor[i] = 0;
+    targetPwmMotor[i] = 0;
+  }
+  portEXIT_CRITICAL(&timerMux);
+
+  // Stop semua motor
   for (int i = 0; i < 10; i++) {
     ledcWrite(pinMotor[i], 0);
   }
 }
 
+void updatePwmThrottle() {
+  if (!throttleEnabled) return;  // Skip jika throttle disabled
+
+  int localTarget[4];
+  int localCurrent[4];
+
+  // Baca target dan current dengan thread safety
+  portENTER_CRITICAL(&timerMux);
+  for (int i = 0; i < 4; i++) {
+    localTarget[i] = targetPwmMotor[i];
+    localCurrent[i] = currentPwmMotor[i];
+  }
+  portEXIT_CRITICAL(&timerMux);
+
+  // Update setiap motor
+  for (int i = 0; i < 4; i++) {
+    int target = localTarget[i];
+    int current = localCurrent[i];
+    int newCurrent = current;
+
+    // Jika target PWM <= threshold, langsung set (bypass throttle)
+    if (abs(target) <= throttleActivationThreshold) {
+      newCurrent = target;
+    }
+    // Jika > threshold, gunakan smooth ramping
+    else {
+      int diff = target - current;
+
+      if (abs(diff) <= throttlePwmStep) {
+        newCurrent = target;
+      } else {
+        if (diff > 0) {
+          newCurrent = current + throttlePwmStep;
+        } else {
+          newCurrent = current - throttlePwmStep;
+        }
+      }
+
+      newCurrent = constrain(newCurrent, -1023, 1023);
+    }
+
+    localCurrent[i] = newCurrent;
+  }
+
+  // Tulis kembali current PWM
+  portENTER_CRITICAL(&timerMux);
+  for (int i = 0; i < 4; i++) {
+    currentPwmMotor[i] = localCurrent[i];
+  }
+  portEXIT_CRITICAL(&timerMux);
+
+  // Apply ke motor
+  setPwmDirect(localCurrent);
+}
+
+
+void setPwmDirect(int pwm[4]) {
+  int chA[] = { M1A, M2A, M3A, M4A };
+  int chB[] = { M1B, M2B, M3B, M4B };
+
+  for (int i = 0; i < 4; i++) {
+    if (pwm[i] > 0) {
+      ledcWrite(chA[i], abs(pwm[i]));
+      ledcWrite(chB[i], 0);
+    } else if (pwm[i] < 0) {
+      ledcWrite(chA[i], 0);
+      ledcWrite(chB[i], abs(pwm[i]));
+    } else {
+      ledcWrite(chA[i], 0);
+      ledcWrite(chB[i], 0);
+    }
+  }
+}
 void setPwm(int pwm[4]) {
   int chA[] = { M1A, M2A, M3A, M4A };
   int chB[] = { M1B, M2B, M3B, M4B };
